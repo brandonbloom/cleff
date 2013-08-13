@@ -18,6 +18,9 @@
 (def handler-idx ioc/USER-START-IDX)
 (def continuation-idx ioc/USER-START-IDX)
 
+(defn handler-message []
+  )
+
 (defn handler-continue []
   )
 
@@ -37,7 +40,8 @@
 ;;; Coroutine state machines
 
 (def handler-terminators
-  {'continue `handler-continue
+  {'message `handler-message
+   'continue `handler-continue
    :Return `handler-return})
 
 (def computation-terminators
@@ -45,19 +49,26 @@
    'value `computation-value
    :Return `computation-return})
 
-(defn handler-fn [bindings-sym env body]
-  `(let [state# (~(ioc/state-machine body 2 env handler-terminators))]
-     (ioc/aset-object state#
-                      ioc/BINDINGS-IDX ~bindings-sym
-                      )
-     ))
+(defn handler-form [operations]
+  (let [args-sym (gensym "args__")]
+    `(let [[operation# ~args-sym] (~'message)]
+       (case operation#
+         ~@(concat (for [[operation arglist body] operations]
+                     `[operation (let [~arglist ~args-sym]
+                                   ~@body)]))
+         ;;TODO forward operation up the handler stack
+         (throw (Exception. (str "Unexpected operation " operation#)))))))
+
+(defn handler-fn [bindings-sym env operations]
+  `(let [state# (~(ioc/state-machine (list (handler-form operations))
+                                     0 env handler-terminators))]
+     (ioc/aset-object state# ioc/BINDINGS-IDX ~bindings-sym)
+     (ioc/run-state-machine state#)
+     state#))
 
 (defn computation-fn [bindings-sym env body]
-  `(let [state# (~(ioc/state-machine body 2 env computation-terminators))]
-     (ioc/aset-object state#
-                      ioc/BINDINGS-IDX ~bindings-sym
-                      )
-     ))
+  `(let [state# (~(ioc/state-machine body 0 env computation-terminators))]
+     (ioc/aset-object state# ioc/BINDINGS-IDX ~bindings-sym)))
 
 
 ;;; Interpretation trampoline
@@ -66,26 +77,43 @@
   (loop [stack (list computation)]
     ))
 
-(defn handle-fn [env handler-body computation-body]
+(defn handle-fn [env operations computation-body]
   (let [bindings-sym (gensym "bindings__")]
     `(let [~bindings-sym (clojure.lang.Var/getThreadBindingFrame)
-           handler# ~(handler-fn bindings-sym env handler-body)
+           handler# ~(handler-fn bindings-sym env operations)
            computation# ~(computation-fn bindings-sym env computation-body)]
-       (run handler computation))))
+       (run handler# computation#))))
 
 
 ;;; User Syntax
 
-(defn handler-fn [cases]
-  )
-
-(defmacro handle [handler-cases]
-  )
+(defmacro handle [operations & body]
+  (handle-fn &env operations body))
 
 
 ;;; Test Code
 
 (comment
+
+  (require 'clojure.pprint)
+
+  (defn ppc [form]
+    (clojure.pprint/write form :dispatch clojure.pprint/code-dispatch))
+
+  (defn ppme [form]
+    (-> form macroexpand ppc))
+
+  (defmacro foo [& form]
+    (ioc/state-machine form 2 &env {:Return handler-return}))
+
+  (ppme
+    '(foo (let [[x y z] :bar] [z y x]))
+    )
+
+  (ppc (handler-form '[]))
+
+  (handle []
+    1)
 
   (handle [(decide [] (continue true))]
     (let [x (if (decide c) 10 20)
