@@ -20,12 +20,10 @@
 (def communication-idx (+ trampoline-idx 1))
 
 (defn handler-message [state blk]
-  (println "handler-message")
   (aset-all! state ioc/STATE-IDX blk)
   nil)
 
 (defn handler-continue [state blk value]
-  (println "handler-continue")
   (aset-all! state
              ioc/STATE-IDX blk
              ioc/VALUE-IDX value
@@ -33,14 +31,12 @@
   nil)
 
 (defn handler-return [state value]
-  (println "handler-return")
   (aset-all! state
              ioc/VALUE-IDX value
-             trampoline-idx :handled)
+             trampoline-idx :return)
   nil)
 
 (defn computation-effect [state blk & message]
-  (println "computation-effect")
   (aset-all! state
              ioc/STATE-IDX blk
              trampoline-idx :effect
@@ -48,7 +44,6 @@
   nil)
 
 (defn computation-value [state blk value]
-  (println "computation-value")
   (aset-all! state
              ioc/STATE-IDX blk
              trampoline-idx :value
@@ -56,10 +51,9 @@
   nil)
 
 (defn computation-return [state value]
-  (println "computation-return")
   (aset-all! state
              ioc/VALUE-IDX value
-             trampoline-idx :computed)
+             trampoline-idx :return)
   nil)
 
 
@@ -83,7 +77,8 @@
                            `[~operation (let [~arglist ~args-sym]
                                           ~@body)]))
          ;;TODO forward operation up the handler stack
-         (throw (Exception. (str "Unexpected operation " operation#)))))))
+         ;;TODO: figure out why this is throwing unconditionally...
+         #_(throw (Exception. (str "Unexpected operation " operation#)))))))
 
 (defn handler-fn [bindings-sym env operations]
   `(let [state# (~(state-machine (list (handler-form operations))
@@ -101,43 +96,35 @@
 
 (defn run [handler computation]
   (loop [stack (list computation)]
-    (println "loop depth:" (count stack))
+    ;(println "loop depth:" (count stack))
     (let [frame (peek stack)]
       (run-state-machine frame)
+      ;(println "step: " (aget-object frame trampoline-idx))
       (case (aget-object frame trampoline-idx)
         :effect
           (let [message (aget-object frame communication-idx)
-                _ (println "Effect:" (pr-str message))
+                ;_ (println "Effect:" (pr-str message))
                 handler* (aset-all! (clone-state handler)
                                     ioc/VALUE-IDX message
                                     communication-idx frame)]
             (recur (-> stack pop (conj handler*))))
         :value
           (let [value (aget-object frame communication-idx)
-                _ (println "Value:" (pr-str value))
+                ;_ (println "Value:" (pr-str value))
                 handler* (aset-all! (clone-state handler)
-                                    ioc/VALUE-IDX value)]
+                                    ioc/VALUE-IDX ['value value]
+                                    communication-idx frame)]
             (recur (-> stack pop (conj handler*))))
         :continue
           (let [value (aget-object frame ioc/VALUE-IDX)
-                _ (println "Continue:" (pr-str value))
+                ;_ (println "Continue:" (pr-str value))
                 continuation (aget-object frame communication-idx)
                 frame* (aset-all! (clone-state continuation)
                                   ioc/VALUE-IDX value)]
             (recur (conj stack frame*)))
-        :handled
+        :return
           (let [value (aget-object frame ioc/VALUE-IDX)
-                _ (println "Handled:" (pr-str value))
-                stack* (pop stack)
-                frame* (peek stack*)]
-            (if frame*
-              (do
-                (aset-all! frame* ioc/VALUE-IDX value)
-                (recur stack*))
-              value))
-        :computed
-          (let [value (aget-object frame ioc/VALUE-IDX)
-                _ (println "Computed:" (pr-str value))
+                ;_ (println "return:" (pr-str value))
                 stack* (pop stack)
                 frame* (peek stack*)]
             (if frame*
@@ -187,9 +174,14 @@
 
   (ppc (handler-form '[]))
   (ppc (handler-form '[(decide [] (continue true))]))
+  (ppc (handler-form '[(decide [] (continue true))
+                       (value [x] x)]))
 
   (handle []
     :foo)
+
+  (handle [(value [x] [x x])]
+    (value :foo))
 
   (handle [(decide [] (continue true))]
     (let [x (if (effect 'decide) 10 20)
@@ -203,7 +195,16 @@
       (- x y)))
   ;;=> 15
 
-  ;; not working yet below here
+  (handle [(value [x]
+             [x])
+           (decide []
+             (concat (continue true) (continue false)))]
+    (let [x (if (effect 'decide) 10 20)
+          y (if (effect 'decide) 0 5)]
+      (value (- x y))))
+  ;;=> (10 5 20 15)
+
+  ;; Not working below here: Cleaned up syntax & effect "instances"
 
   (handle [(decide [] (continue true))]
     (let [x (if (decide c) 10 20)
