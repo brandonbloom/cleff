@@ -14,23 +14,32 @@
     clone))
 
 
+;;; Protocols
+
+(defprotocol IEffect)
+
+(defprotocol IHandler
+  (-value [this])
+  (-operation [this effect name]))
+
+
 ;;; Terminator implementations
 
 (def trampoline-idx ioc/USER-START-IDX)
 (def communication-idx (+ trampoline-idx 1))
 
-(defn handler-message [state blk]
+(defn operation-message [state blk]
   (aset-all! state ioc/STATE-IDX blk)
   nil)
 
-(defn handler-continue [state blk value]
+(defn operation-continue [state blk value]
   (aset-all! state
              ioc/STATE-IDX blk
              ioc/VALUE-IDX value
              trampoline-idx :continue)
   nil)
 
-(defn handler-return [state value]
+(defn operation-return [state value]
   (aset-all! state
              ioc/VALUE-IDX value
              trampoline-idx :return)
@@ -59,33 +68,23 @@
 
 ;;; Coroutine state machines
 
-(def handler-terminators
-  {'message `handler-message
-   'continue `handler-continue
-   :Return `handler-return})
+(def operation-terminators
+  {'message `operation-message
+   'continue `operation-continue
+   :Return `operation-return})
 
 (def computation-terminators
   {'effect `computation-effect
    'value `computation-value
    :Return `computation-return})
 
-(defn handler-form [operations]
-  (let [args-sym (gensym "args__")]
-    `(let [[operation# & ~args-sym] (~'message)]
-       (case operation#
-         ~@(apply concat (for [[operation arglist & body] operations]
-                           `[~operation (let [~arglist ~args-sym]
-                                          ~@body)]))
-         ;;TODO forward operation up the handler stack
-         ;;TODO: figure out why this is throwing unconditionally...
-         #_(throw (Exception. (str "Unexpected operation " operation#)))))))
-
-(defn handler-fn [bindings-sym env operations]
-  `(let [state# (~(state-machine (list (handler-form operations))
-                                 2 env handler-terminators))]
-     (aset-all! state# ioc/BINDINGS-IDX ~bindings-sym)
-     (run-state-machine state#)
-     state#))
+(defn operation-fn [bindings-sym env args body]
+  ;; XXX Need 'do because destructuring is broken for top-level lets in IOC.
+  (let [form `(do (let [~args (~'message)] ~@body))]
+    `(let [state# (~(state-machine form 2 env operation-terminators))]
+       (aset-all! state# ioc/BINDINGS-IDX ~bindings-sym)
+       (run-state-machine state#)
+       state#)))
 
 (defn computation-fn [bindings-sym env body]
   `(let [state# (~(state-machine body 2 env computation-terminators))]
@@ -102,19 +101,24 @@
       ;(println "step: " (aget-object frame trampoline-idx))
       (case (aget-object frame trampoline-idx)
         :effect
-          (let [message (aget-object frame communication-idx)
-                ;_ (println "Effect:" (pr-str message))
-                handler* (aset-all! (clone-state handler)
-                                    ioc/VALUE-IDX message
-                                    communication-idx frame)]
-            (recur (-> stack pop (conj handler*))))
+          (let [[effect operation & args] (aget-object frame communication-idx)
+                ;_ (println "Effect:" (pr-str effect operation args))
+                frame* (-operation handler effect operation)
+                _ (assert frame* "Operation not found") ;TODO handler stack
+                frame* (clone-state frame*)]
+            (aset-all! frame*
+                       ioc/VALUE-IDX args
+                       communication-idx frame)
+            (recur (-> stack pop (conj frame*))))
         :value
           (let [value (aget-object frame communication-idx)
                 ;_ (println "Value:" (pr-str value))
-                handler* (aset-all! (clone-state handler)
-                                    ioc/VALUE-IDX ['value value]
-                                    communication-idx frame)]
-            (recur (-> stack pop (conj handler*))))
+                frame* (-value handler)
+                _ (assert frame*) ;TODO pass up handler stack
+                frame* (clone-state frame*)]
+            (aset-all! frame*
+                       ioc/VALUE-IDX [value])
+            (recur (-> stack pop (conj frame*))))
         :continue
           (let [value (aget-object frame ioc/VALUE-IDX)
                 ;_ (println "Continue:" (pr-str value))
@@ -136,18 +140,47 @@
                                 (pr-str (aget-object frame trampoline-idx)))))
         ))))
 
-(defn handle-fn [env operations computation-body]
-  (let [bindings-sym (gensym "bindings__")]
-    `(let [~bindings-sym (clojure.lang.Var/getThreadBindingFrame)
-           handler# ~(handler-fn bindings-sym env operations)
-           computation# ~(computation-fn bindings-sym env computation-body)]
-       (run handler# computation#))))
-
 
 ;;; User Syntax
 
-(defmacro handle [operations & body]
-  (handle-fn &env operations body))
+;;TODO parameterize with effect type
+(defn instance []
+  (reify IEffect))
+
+;;TODO better specs syntax & parser
+(defn handler-fn [bindings-sym env specs]
+  (letfn [(impl-map [operations]
+            (into {} (for [[name args & body] operations]
+                       [(list 'quote name)
+                        (operation-fn bindings-sym env args body)])))
+          (effect-map [specs]
+            (let [specs* (->> specs (partition-by seq?) (partition 2))]
+              (into {} (for [[[effect] operations] specs*]
+                         [effect (impl-map operations)]))))]
+    `(let [map# ~(effect-map specs)]
+       (reify IHandler
+         (-value [this#]
+           (-operation this# ::none '~'value))
+         (-operation [this# effect# name#]
+           (get-in map# [effect# name#]))))))
+
+(defmacro handler [& specs]
+  (let [bindings-sym (gensym "bindings__")]
+    `(let [~bindings-sym (clojure.lang.Var/getThreadBindingFrame)]
+       ~(handler-fn bindings-sym &env specs))))
+
+(defmacro handle-with [handler & body]
+  (let [bindings-sym (gensym "bindings__")]
+    `(let [~bindings-sym (clojure.lang.Var/getThreadBindingFrame)
+           computation# ~(computation-fn bindings-sym &env body)]
+       (run ~handler computation#))))
+
+(defmacro handle [specs & body]
+  (let [bindings-sym (gensym "bindings__")]
+    `(let [~bindings-sym (clojure.lang.Var/getThreadBindingFrame)
+           handler# ~(handler-fn bindings-sym &env specs)
+           computation# ~(computation-fn bindings-sym &env body)]
+       (run handler# computation#))))
 
 
 ;;; Test Code
@@ -163,7 +196,12 @@
     (-> form macroexpand ppc))
 
   (defmacro foo [& form]
-    (state-machine form 0 &env {:Return `handler-return}))
+    (state-machine form 0 &env {:Return `operation-return}))
+
+  (defn choice []
+    (instance))
+
+  (def c (choice))
 
   (ppme '(foo :bar))
 
@@ -171,52 +209,65 @@
     '(foo (let [[x y z] :bar] [z y x]))
     )
 
+  (ppme '(handler))
 
-  (ppc (handler-form '[]))
-  (ppc (handler-form '[(decide [] (continue true))]))
-  (ppc (handler-form '[(decide [] (continue true))
-                       (value [x] x)]))
+  (ppme '(handler ::none (value [x] x)))
+
+  (ppme '(handler c (decide [] (continue true))))
 
   (handle []
     :foo)
 
-  (handle [(value [x] [x x])]
+  (ppme
+  '(handle [::none (value [x] [x x])]
     (value :foo))
+    )
 
-  (handle [(decide [] (continue true))]
-    (let [x (if (effect 'decide) 10 20)
-          y (if (effect 'decide) 0 5)]
-      (- x y)))
+  (let [c (choice)]
+    (handle [c (decide [] (continue true))]
+      (let [x (if (effect c 'decide) 10 20)
+            y (if (effect c 'decide) 0 5)]
+        (- x y))))
   ;;=> 10
 
-  (handle [(decide [] (continue false))]
-    (let [x (if (effect 'decide) 10 20)
-          y (if (effect 'decide) 0 5)]
-      (- x y)))
+  (let [c (choice)]
+    (handle [c (decide [] (continue false))]
+      (let [x (if (effect c 'decide) 10 20)
+            y (if (effect c 'decide) 0 5)]
+        (- x y))))
   ;;=> 15
 
-  (handle [(value [x]
-             [x])
-           (decide []
-             (concat (continue true) (continue false)))]
-    (let [x (if (effect 'decide) 10 20)
-          y (if (effect 'decide) 0 5)]
-      (value (- x y))))
+  (defn choose-all [c]
+    (handler
+      ::none
+      (value [x] [x])
+      c
+      (decide []
+        (concat (continue true) (continue false)))))
+
+  (let [c (choice)]
+    (handle-with (choose-all c)
+      (let [x (if (effect c 'decide) 10 20)
+            y (if (effect c 'decide) 0 5)]
+        (value (- x y)))))
   ;;=> (10 5 20 15)
 
-  ;; Not working below here: Cleaned up syntax & effect "instances"
+  ;; Not working below here: Need handler stacks
 
-  (handle [(decide [] (continue true))]
-    (let [x (if (decide c) 10 20)
-          y (if (decide c) 0 5)]
-      (- x y)))
+  (let [c1 (choice) c2 (choice)]
+    (handle-with (choose-all c1)
+      (handle-with (choose-all c2)
+        (let [x (if (effect c1 'decide) 10 20)
+              y (if (effect c2 'decide) 0 5)]
+          (value (- x y))))))
+  ;;=> ((10 5) (20 15))
 
-  (handle [(value [x]
-             [x])
-           (decide []
-             (concat (continue true) (continue false)))]
-    (let [x (if (decide c) 10 20)
-          y (if (decide c) 0 5)]
-      (value (- x y))))
+  (let [c1 (choice) c2 (choice)]
+    (handle-with (choose-all c1)
+      (handle-with (choose-all c2)
+        (let [x (if (effect c2 'decide) 10 20)
+              y (if (effect c1 'decide) 0 5)]
+          (value (- x y))))))
+  ;;=> ((10 20) (5 15))
 
 )
