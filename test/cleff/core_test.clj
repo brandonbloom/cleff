@@ -52,3 +52,24 @@
          '((10 5) (20 15))))
 
 )
+
+(deftest exception-test
+
+  (defn exception []
+    (instance))
+
+  (def e (exception))
+
+  (def optionalize
+    (handler
+      (value [x] [:some x])
+      e
+      (raise [_] :none)))
+
+  (is (= (handle-with optionalize 1)
+         [:some 1]))
+
+  (is (= (handle-with optionalize (effect e 'raise "Disaster!"))
+         :none))
+
+)
