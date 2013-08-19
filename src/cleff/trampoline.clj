@@ -17,117 +17,140 @@
 
 ;;; Terminator implementations
 
-(def trampoline-idx ioc/USER-START-IDX)
-(def communication-idx (+ trampoline-idx 1))
+(def TRAMPOLINE-IDX       ioc/USER-START-IDX   )
+(def COMMUNICATION-IDX (+ ioc/USER-START-IDX 1))
+(def HANDLER-IDX       (+ ioc/USER-START-IDX 2))
+(def USER-COUNT                              3 )
 
-(defn operation-message [state blk]
+(defn begin [state blk]
   (aset-all! state ioc/STATE-IDX blk)
   nil)
 
-(defn operation-continue [state blk value]
+(defn continue [state blk value]
   (aset-all! state
              ioc/STATE-IDX blk
              ioc/VALUE-IDX value
-             trampoline-idx :continue)
+             TRAMPOLINE-IDX :continue)
   nil)
 
-(defn operation-return [state value]
-  (aset-all! state
-             ioc/VALUE-IDX value
-             trampoline-idx :return)
-  nil)
-
-(defn computation-effect [state blk & message]
+(defn effect [state blk & args]
   (aset-all! state
              ioc/STATE-IDX blk
-             trampoline-idx :effect
-             communication-idx message)
+             TRAMPOLINE-IDX :effect
+             COMMUNICATION-IDX args)
   nil)
 
-(defn computation-value [state blk value]
+(defn run-with [state blk & args]
   (aset-all! state
              ioc/STATE-IDX blk
-             trampoline-idx :value
-             communication-idx value)
+             TRAMPOLINE-IDX :run-with
+             COMMUNICATION-IDX args)
   nil)
 
-(defn computation-return [state value]
+(defn return [state value]
   (aset-all! state
              ioc/VALUE-IDX value
-             trampoline-idx :return)
+             TRAMPOLINE-IDX :return)
   nil)
 
 
 ;;; Coroutine state machines
 
 (def operation-terminators
-  {'message `operation-message
-   'continue `operation-continue
-   :Return `operation-return})
+  {'begin `begin
+   'continue `continue
+   :Return `return})
+
+(def transform-terminators
+  {'begin `begin
+   :Return `return})
 
 (def computation-terminators
-  {'effect `computation-effect
-   'value `computation-value
-   :Return `computation-return})
+  {'effect `effect
+   'cleff.core/run-with `run-with
+   :Return `return})
 
-(defn operation-fn [bindings-sym env args body]
+(defn handler-form [terminators bindings-sym env args body]
   ;; XXX Need 'do because destructuring is broken for top-level lets in IOC.
-  (let [form `(do (let [~args (~'message)] ~@body))]
-    `(let [state# (~(state-machine form 2 env operation-terminators))]
+  (let [form `(do (let [~args (~'begin)] ~@body))]
+    `(let [state# (~(state-machine form USER-COUNT env terminators))]
        (aset-all! state# ioc/BINDINGS-IDX ~bindings-sym)
        (run-state-machine state#)
        state#)))
 
-(defn computation-fn [bindings-sym env body]
-  `(let [state# (~(state-machine body 2 env computation-terminators))]
+(defn operation-form [bindings-sym env args body]
+  (handler-form operation-terminators bindings-sym env args body))
+
+(defn transform-form [bindings-sym env arg body]
+  (handler-form transform-terminators bindings-sym env arg body))
+
+(defn computation-form [bindings-sym env body]
+  `(let [state# (~(state-machine body USER-COUNT env computation-terminators))]
      (aset-all! state# ioc/BINDINGS-IDX ~bindings-sym)))
 
 
-;;; Interpretation
+;;; Interpreter
+
+(defn push-handler [stack handler]
+  (let [value-frame (clone-state (proto/-value handler))]
+    (aset-all! value-frame HANDLER-IDX handler)
+    (if-let [finally-frame (proto/-finally handler)]
+      (conj stack finally-frame (clone-state value-frame))
+      (conj stack value-frame))))
+
+(defmulti step-method (fn [frame stack]
+                        ;(println "step:" (aget-object frame TRAMPOLINE-IDX))
+                        (aget-object frame TRAMPOLINE-IDX)))
+
+(defmethod step-method :effect [frame stack]
+  (let [[effect operation & args] (aget-object frame COMMUNICATION-IDX)]
+    ;(println "Effect:" (pr-str effect operation args))
+    (loop [continuation (list frame)
+           [frame* & stack*] stack]
+      (if frame*
+        (let [frame* (clone-state frame*)
+              handler (aget-object frame* HANDLER-IDX)]
+          (if-let [op-frame (and handler (proto/-operation handler effect operation))]
+            (conj stack* (aset-all! (clone-state op-frame)
+                                    ioc/VALUE-IDX args
+                                    COMMUNICATION-IDX (conj continuation frame*)))
+            (recur (conj continuation frame*) stack*)))
+        (throw (Exception. (str "No handler for " operation " on " effect)))))))
+
+(defmethod step-method :run-with [frame stack]
+  (let [[handler computation] (aget-object frame COMMUNICATION-IDX)]
+    ;(println "Run With:" (pr-str handler computation))
+    (-> stack
+        (conj frame)
+        (push-handler handler)
+        (conj computation))))
+
+(defmethod step-method :continue [frame stack]
+  (let [value (aget-object frame ioc/VALUE-IDX)
+        ;_ (println "Continue:" (pr-str value))
+        continuation (aget-object frame COMMUNICATION-IDX)
+        stack* (into (conj stack frame) (map clone-state continuation))]
+    (aset-all! (peek stack*) ioc/VALUE-IDX value)
+    stack*))
+
+(defmethod step-method :return [frame stack]
+  (let [value (aget-object frame ioc/VALUE-IDX)]
+    ;(println "return:" (pr-str value))
+    (if-let [frame* (peek stack)]
+      (do
+        (aset-all! frame* ioc/VALUE-IDX value)
+        stack)
+      (reduced value))))
+
+(defn step [stack]
+  ;(println "stack depth:" (count stack))
+  (let [[frame & stack*] stack]
+    (run-state-machine frame)
+    (step-method frame stack*)))
 
 (defn run [handler computation]
-  (loop [stack (list computation)]
-    ;(println "loop depth:" (count stack))
-    (let [frame (peek stack)]
-      (run-state-machine frame)
-      ;(println "step: " (aget-object frame trampoline-idx))
-      (case (aget-object frame trampoline-idx)
-        :effect
-          (let [[effect operation & args] (aget-object frame communication-idx)
-                ;_ (println "Effect:" (pr-str effect operation args))
-                frame* (proto/-operation handler effect operation)
-                _ (assert frame* "Operation not found") ;TODO handler stack
-                frame* (clone-state frame*)]
-            (aset-all! frame*
-                       ioc/VALUE-IDX args
-                       communication-idx frame)
-            (recur (-> stack pop (conj frame*))))
-        :value
-          (let [value (aget-object frame communication-idx)
-                ;_ (println "Value:" (pr-str value))
-                frame* (proto/-value handler)
-                _ (assert frame*) ;TODO pass up handler stack
-                frame* (clone-state frame*)]
-            (aset-all! frame*
-                       ioc/VALUE-IDX [value])
-            (recur (-> stack pop (conj frame*))))
-        :continue
-          (let [value (aget-object frame ioc/VALUE-IDX)
-                ;_ (println "Continue:" (pr-str value))
-                continuation (aget-object frame communication-idx)
-                frame* (aset-all! (clone-state continuation)
-                                  ioc/VALUE-IDX value)]
-            (recur (conj stack frame*)))
-        :return
-          (let [value (aget-object frame ioc/VALUE-IDX)
-                ;_ (println "return:" (pr-str value))
-                stack* (pop stack)
-                frame* (peek stack*)]
-            (if frame*
-              (do
-                (aset-all! frame* ioc/VALUE-IDX value)
-                (recur stack*))
-              value))
-        (throw (Exception. (str "Unexpected trampoline command:  "
-                                (pr-str (aget-object frame trampoline-idx)))))
-        ))))
+  (loop [i 0 stack (-> nil (push-handler handler) (conj computation))]
+    (when (> i 50) (throw (Exception. "ITERATION LIMIT"))) ;TODO delete me
+    (if (reduced? stack)
+      @stack
+      (recur (inc i) (step stack)))))
