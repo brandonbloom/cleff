@@ -8,7 +8,7 @@ aims to provide a proof of concept implementation of all of the examples in
 
 ## Status
 
-The basics of handler and computation co-routines are working.
+The basics of first-class effects and handlers are working.
 
 Here's a simple non-deterministic choice effect:
 
@@ -33,6 +33,8 @@ Lots left to do:
 - Polish up the syntax
 - defprotocol-style defeffect
 - Subroutines for coping with core.async's lexical IOC
+
+See the `test/` directory for some more examples.
 
 ## License
 
