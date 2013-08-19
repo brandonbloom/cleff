@@ -81,20 +81,6 @@
   (ppme '(handle [(value [x] [x x])]
            :foo))
 
-  (let [c (choice)]
-    (handle [c (decide [] (continue true))]
-      (let [x (if (effect c 'decide) 10 20)
-            y (if (effect c 'decide) 0 5)]
-        (- x y))))
-  ;;=> 10
-
-  (let [c (choice)]
-    (handle [c (decide [] (continue false))]
-      (let [x (if (effect c 'decide) 10 20)
-            y (if (effect c 'decide) 0 5)]
-        (- x y))))
-  ;;=> 15
-
   (defn choose-all [c]
     (handler
       (value [x] [x])
