@@ -71,9 +71,8 @@
    :Return `return})
 
 (defn handler-form [terminators bindings-sym env args body]
-  ;; XXX Need 'do because destructuring is broken for top-level lets in IOC.
-  (let [form `(do (let [~args (~'begin)] ~@body))]
-    `(let [state# (~(state-machine form USER-COUNT env terminators))]
+  (let [form `(let [~args (~'begin)] ~@body)]
+    `(let [state# (~(state-machine (list form) USER-COUNT env terminators))]
        (aset-all! state# ioc/BINDINGS-IDX ~bindings-sym)
        (run-state-machine state#)
        state#)))
