@@ -13,24 +13,25 @@ The basics of handler and computation co-routines are working.
 Here's a simple non-deterministic choice effect:
 
 ```clojure
-(handle [(value [x]
-           [x])
-         (decide []
-           (concat (continue true) (continue false)))]
-  (let [x (if (effect 'decide) 10 20)
-        y (if (effect 'decide) 0 5)]
-    (value (- x y))))
+(defn choose-all [c]
+  (handler
+    (value [x] [x])
+    c
+    (decide []
+      (concat (continue true) (continue false)))))
+
+(let [c (choice)]
+  (handle-with (choose-all c)
+    (let [x (if (effect c 'decide) 10 20)
+          y (if (effect c 'decide) 0 5)]
+      (- x y))))
 ;;=> (10 5 20 15)
 ```
 
 Lots left to do:
 
-- Automatic insertion of "value" effects
-- Effect instances
-- Handlers for "finally"
+- Polish up the syntax
 - defprotocol-style defeffect
-- Reusable/composable handlers
-- Hierarchical handlers with forwarding
 - Subroutines for coping with core.async's lexical IOC
 
 ## License
